@@ -1,4 +1,4 @@
-# **🐂 Tokenized Circular Cattle – Project Documentation**
+# **🐂 ZK-Sealed: Private Cattle Auctions on Starknet – Project Documentation**
 
 ## **Table of Contents**
 
