@@ -4,8 +4,8 @@ import "~~/styles/globals.css";
 import { ThemeProvider } from "~~/components/ThemeProvider";
 
 export const metadata: Metadata = {
-  title: "GTC",
-  description: "Ganado Tokenizado Circular",
+  title: "ZSC",
+  description: "zk-sealed-cattle",
   icons: "/cabtoro.ico",
 };
 

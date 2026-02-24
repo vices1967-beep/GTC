@@ -1,4 +1,8 @@
-# **🐂 ZK-Sealed: Private Cattle Auctions on Starknet – Project Documentation**
+# 🐂 zk-sealed-cattle
+![Starknet](https://img.shields.io/badge/Starknet-Sepolia-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+**Sealed‑Bid Feedlot Auction with Zero-Knowledge Proofs**
 
 ## **Table of Contents**
 

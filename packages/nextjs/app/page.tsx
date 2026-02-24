@@ -80,6 +80,8 @@ export default function Home() {
   const [paidLotes, setPaidLotes] = useState<Record<string, boolean>>({});
   const [participatedLotes, setParticipatedLotes] = useState<Record<string, boolean>>({});
   const [proofGeneratedLotes, setProofGeneratedLotes] = useState<Record<string, boolean>>({});
+  // NUEVO: estado para lotes finalizados con ZK
+  const [zkFinalizedLotes, setZkFinalizedLotes] = useState<Record<string, boolean>>({});
 
   // Calldata para el pago (ganador)
   const [calldataPago, setCalldataPago] = useState<string[]>([]);
@@ -110,10 +112,8 @@ export default function Home() {
     }
     const loadCalldataSeleccion = async () => {
       try {
-        // Intenta cargar un archivo específico para ese lote, ej. /calldata_lote5.txt
         const response = await fetch(`/calldata_lote${selectedLotId}.txt`);
         if (!response.ok) {
-          // Si no existe, simplemente no hay calldata para este lote
           setCalldataSeleccion([]);
           return;
         }
@@ -160,6 +160,7 @@ export default function Home() {
       setPaidLotes({});
       setParticipatedLotes({});
       setProofGeneratedLotes({});
+      setZkFinalizedLotes({}); // NUEVO
       return;
     }
     const accountKey = account.address.toLowerCase();
@@ -172,6 +173,10 @@ export default function Home() {
 
     const savedProofGenerated = localStorage.getItem(`proofGeneratedLotes_${accountKey}`);
     setProofGeneratedLotes(savedProofGenerated ? JSON.parse(savedProofGenerated) : {});
+
+    // NUEVO: cargar zkFinalizedLotes
+    const savedZkFinalized = localStorage.getItem(`zkFinalizedLotes_${accountKey}`);
+    setZkFinalizedLotes(savedZkFinalized ? JSON.parse(savedZkFinalized) : {});
   }, [account]);
 
   // Save per‑account data
@@ -192,6 +197,13 @@ export default function Home() {
     const accountKey = account.address.toLowerCase();
     localStorage.setItem(`proofGeneratedLotes_${accountKey}`, JSON.stringify(proofGeneratedLotes));
   }, [proofGeneratedLotes, account]);
+
+  // NUEVO: guardar zkFinalizedLotes
+  useEffect(() => {
+    if (!account) return;
+    const accountKey = account.address.toLowerCase();
+    localStorage.setItem(`zkFinalizedLotes_${accountKey}`, JSON.stringify(zkFinalizedLotes));
+  }, [zkFinalizedLotes, account]);
 
   // Clock
   useEffect(() => {
@@ -525,13 +537,28 @@ export default function Home() {
       const tx2 = await account.execute([call]);
       await account.waitForTransaction(tx2.transaction_hash);
 
+      // NUEVO: obtener información actualizada del lote
+      const updatedInfo = await contract.get_lot_info(selectedLotId);
+      const updatedLot = {
+        ...selectedLotInfo,
+        ...updatedInfo,
+        finalizado: updatedInfo.finalizado,
+        mejor_puja: updatedInfo.mejor_puja?.toString() || "0",
+        mejor_postor: toHexAddress(updatedInfo.mejor_postor),
+      };
+      setSelectedLotInfo(updatedLot);
+
       // Refresh all lots to get the updated status
       await fetchAllLots(true);
-      toast.success("✅ Lot finalized with ZK (fixed calldata)");
+
+      // NUEVO: marcar como finalizado con ZK
+      setZkFinalizedLotes((prev) => ({ ...prev, [selectedLotId]: true }));
 
       // Store both transaction hashes
       localStorage.setItem(`proof_tx_${selectedLotId}`, tx.transaction_hash);
       localStorage.setItem(`finalize_tx_${selectedLotId}`, tx2.transaction_hash);
+
+      toast.success("✅ Lot finalized with ZK (fixed calldata)");
     } catch (error: any) {
       console.error("❌ Finalization error:", error);
       toast.error("Verification failed: " + error.message);
@@ -557,7 +584,15 @@ export default function Home() {
 
   return (
     <div className="container mx-auto p-4 md:p-8 max-w-7xl">
-      <h1 className="text-3xl font-bold mb-6 text-center">🐂 Sealed‑Bid Feedlot Auction</h1>
+      <div className="text-center mb-8">
+        <h1 className="text-4xl font-bold mb-2">🐂 ZK-Sealed Cattle</h1>
+        <p className="text-xl text-gray-600 dark:text-gray-400">Zero-Knowledge Sealed-Bid Auction on Starknet</p>
+        <div className="mt-2">
+          <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200">
+            Sepolia Testnet
+          </span>
+        </div>
+      </div>
 
       {errorMessage && (
         <div className="alert alert-error mb-4">
@@ -687,6 +722,8 @@ export default function Home() {
                     normalizeAddress(lot.mejor_postor) === normalizeAddress(account.address);
                   const pagado = esGanador && paidLotes[lot.id.toString()];
                   const proofGenerated = esGanador && proofGeneratedLotes[lot.id.toString()];
+                  // NUEVO: verificar si fue finalizado con ZK
+                  const zkFinalized = zkFinalizedLotes[lot.id.toString()];
 
                   return (
                     <tr
@@ -718,7 +755,12 @@ export default function Home() {
                         ) : esGanador ? (
                           <span className="badge badge-warning badge-sm md:badge-md">Pending</span>
                         ) : lot.finalizado ? (
-                          <span className="badge badge-neutral badge-sm md:badge-md">Finalized</span>
+                          // NUEVO: si fue finalizado con ZK, mostramos un badge especial
+                          zkFinalized ? (
+                            <span className="badge badge-info badge-sm md:badge-md">ZK Finalized</span>
+                          ) : (
+                            <span className="badge badge-neutral badge-sm md:badge-md">Finalized</span>
+                          )
                         ) : active ? (
                           <span className="badge badge-info badge-sm md:badge-md">Active</span>
                         ) : (
@@ -777,11 +819,13 @@ export default function Home() {
             </div>
             <div>
               <strong>Status:</strong>{" "}
-              {selectedLotInfo.finalizado
-                ? "Finalized"
-                : isAuctionActive(selectedLotInfo)
-                ? "Active"
-                : "Ended"}
+              {selectedLotInfo.finalizado ? (
+                zkFinalizedLotes[selectedLotId] ? "ZK Finalized" : "Finalized"
+              ) : isAuctionActive(selectedLotInfo) ? (
+                "Active"
+              ) : (
+                "Ended"
+              )}
             </div>
             {!selectedLotInfo.finalizado && isAuctionActive(selectedLotInfo) && (
               <div>
