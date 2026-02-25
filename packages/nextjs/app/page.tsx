@@ -39,10 +39,9 @@ function normalizeAddress(addr: string): string {
   return "0x" + (hex || "0");
 }
 
-// Payment verifier address (deployed)
-const VERIFIER_ADDRESS = "0x07b31788d2d06f1b80696f38ba7224f3595cc482dbd2f816165dbc7cdf476c14";
-// Selection verifier address (deployed)
-const AUCTION_VERIFIER_ADDRESS = "0x05c76e04b1384953264c98d5dc1f5b69d44e2cb6086567fe7944c62b08b58080";
+// Direcciones de los verificadores obtenidas desde variables de entorno
+const VERIFIER_ADDRESS = process.env.NEXT_PUBLIC_PAYMENT_VERIFIER_ADDRESS || '';
+const AUCTION_VERIFIER_ADDRESS = process.env.NEXT_PUBLIC_AUCTION_VERIFIER_ADDRESS || '';
 
 export default function Home() {
   const { account: walletAccount } = useAccount();
@@ -239,7 +238,7 @@ export default function Home() {
   // Owner check
   useEffect(() => {
     if (activeAccountAddress) {
-      const ownerAddress = "0x0626bb9241ba6334ae978cfce1280d725e727a6acb5e61392ab4cee031a4b7ca".toLowerCase();
+      const ownerAddress = (process.env.NEXT_PUBLIC_OWNER_ADDRESS || "0x0626bb9241ba6334ae978cfce1280d725e727a6acb5e61392ab4cee031a4b7ca").toLowerCase();
       setOwner(ownerAddress);
       const normalizedAccount = normalizeAddress(activeAccountAddress);
       const normalizedOwner = normalizeAddress(ownerAddress);

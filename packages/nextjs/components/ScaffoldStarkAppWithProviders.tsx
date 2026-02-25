@@ -57,20 +57,21 @@ export const ScaffoldStarkAppWithProviders = ({
 
   if (!mounted) return null;
 
+  // Configuración de Cavos usando variables de entorno
   const cavosConfig = {
-    appId: 'd3a4a051-795d-47ea-994e-8aaf9626e335',
-    paymasterApiKey: 'cav_TqWxZa2kpUGed304VKEPTKAT30txunyatMOyH4hCTtSnHMyL',
+    appId: process.env.NEXT_PUBLIC_CAVOS_APP_ID || '',
+    paymasterApiKey: process.env.NEXT_PUBLIC_CAVOS_PAYMASTER_API_KEY || '',
     network: 'sepolia' as const,
     session: {
       defaultPolicy: {
         allowedContracts: [
-          '0x74694c150c1b9ff90573c6d856d29cbd1ab3d55252abd4ef4c9827c28482743', // Nuevo contrato de subasta
-          '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7', // STRK token
+          process.env.NEXT_PUBLIC_AUCTION_CONTRACT_ADDRESS || '',
+          process.env.NEXT_PUBLIC_STRK_TOKEN_ADDRESS || '',
         ],
         spendingLimits: [
           {
-            token: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7',
-            limit: 1000n * 10n ** 18n,
+            token: process.env.NEXT_PUBLIC_STRK_TOKEN_ADDRESS || '',
+            limit: 1000n * 10n ** 18n, // 1000 STRK (puedes hacer configurable si lo deseas)
           },
         ],
         maxCallsPerTx: 10,
