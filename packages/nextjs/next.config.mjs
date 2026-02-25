@@ -11,9 +11,7 @@ const withPWA = nextPWA({
 
 const nextConfig = {
   reactStrictMode: true,
-  logging: {
-    incomingRequests: false,
-  },
+  logging: { incomingRequests: false },
   images: {
     dangerouslyAllowSVG: true,
     remotePatterns: [
@@ -35,6 +33,30 @@ const nextConfig = {
   eslint: {
     ignoreDuringBuilds: process.env.NEXT_PUBLIC_IGNORE_BUILD_ERROR === "true",
   },
+  // ✅ Proxy para ambos endpoints del backend ZK
+  async rewrites() {
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://miniature-palm-tree-pjqg75xvjjrjfggr-3001.app.github.dev';
+    return [
+      // Endpoint de selección (finalización)
+      {
+        source: '/api/zk-proof',
+        destination: `${backendUrl}/api/zk-proof`,
+      },
+      {
+        source: '/api/zk-proof/:path*',
+        destination: `${backendUrl}/api/zk-proof/:path*`,
+      },
+      // Endpoint de pago
+      {
+        source: '/api/zk-payment',
+        destination: `${backendUrl}/api/zk-payment`,
+      },
+      {
+        source: '/api/zk-payment/:path*',
+        destination: `${backendUrl}/api/zk-payment/:path*`,
+      },
+    ];
+  },
   webpack: (config, { dev, isServer }) => {
     config.resolve.fallback = { fs: false, net: false, tls: false };
     config.externals.push("pino-pretty", "lokijs", "encoding");
@@ -43,19 +65,9 @@ const nextConfig = {
         resource.request = resource.request.replace(/^node:/, "");
       }),
     );
-
-    // 👇 Redirigir importaciones de src a dist
-    config.resolve.alias = {
-      ...config.resolve.alias,
-      '@fatsolutions/tongo-sdk/src': '@fatsolutions/tongo-sdk/dist',
-    };
-
     if (dev && !isServer) {
-      config.infrastructureLogging = {
-        level: "error",
-      };
+      config.infrastructureLogging = { level: "error" };
     }
-
     return config;
   },
 };
