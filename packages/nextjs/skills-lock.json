@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "cavos-react-sdk": {
+      "source": "cavos-labs/cavos-skills",
+      "sourceType": "github",
+      "computedHash": "421719a4a0da0fcf36e333c5ed42c21c0c81e1ebff28ef275e9037d8cfe752e7"
+    }
+  }
+}

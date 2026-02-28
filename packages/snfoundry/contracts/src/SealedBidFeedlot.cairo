@@ -2,6 +2,7 @@ use starknet::ContractAddress;
 use core::num::traits::Zero;
 use core::poseidon::poseidon_hash_span;
 use starknet::get_block_timestamp;
+use starknet::get_tx_info;
 use core::byte_array::ByteArray;
 
 #[derive(Drop, Serde, starknet::Store)]
@@ -42,18 +43,31 @@ pub trait ISealedBidFeedlot<TContractState> {
     // Bidders management
     fn get_bidders_count(self: @TContractState, lot_id: u256) -> u32;
     fn get_bidder_at(self: @TContractState, lot_id: u256, index: u32) -> ContractAddress;
+    // Payment verification
+    fn set_payment_verifier(ref self: TContractState, verifier_address: ContractAddress);
+    fn verify_payment(ref self: TContractState, lot_id: u256, proof: Span<felt252>);
+    fn is_payment_done(self: @TContractState, lot_id: u256) -> bool;
+    // Winner registry
+    fn get_winner(self: @TContractState, lot_id: u256) -> (ContractAddress, u256);
+    // Debug function
+    fn debug_reveal(self: @TContractState, lot_id: u256, amount: u256, nonce: felt252) -> (felt252, felt252, ContractAddress, ContractAddress);
 }
 
-// Interface for the selection verifier
+// Interface for the auction verifier (used in finalize_with_zk)
 #[starknet::interface]
 pub trait IAuctionVerifier<TContractState> {
     fn verify_ultra_keccak_honk_proof(self: @TContractState, full_proof_with_hints: Span<felt252>) -> Option<Span<u256>>;
 }
 
+// Note: IPaymentVerifier is not directly used because we call via syscall, so we can omit it.
+// If you want to keep it for consistency, add #[allow(unused_imports)] when importing.
+
 #[starknet::contract]
 mod SealedBidFeedlot {
-    use super::{ISealedBidFeedlot, IAuctionVerifier, poseidon_hash_span, LotInfo, Zero, get_block_timestamp, ByteArray};
-    use starknet::{ContractAddress, get_caller_address, get_tx_info};
+    use super::{
+        ISealedBidFeedlot, poseidon_hash_span, LotInfo, Zero, get_block_timestamp, ByteArray, get_tx_info
+    };
+    use starknet::{ContractAddress, get_caller_address};
     use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess, StoragePointerWriteAccess};
 
     #[storage]
@@ -62,18 +76,20 @@ mod SealedBidFeedlot {
         lots: Map<u256, LotInfo>,
         owner: Map<(), ContractAddress>,
         lot_count: felt252,
-        // New: bidders counter per lot
         bidders_count: Map<u256, u32>,
-        // New: mapping (lot, index) -> bidder address
         bidder_at: Map<(u256, u32), ContractAddress>,
-        // New: address of the selection verifier
         auction_verifier: ContractAddress,
+        payment_verifier: ContractAddress,
+        payment_done: Map<u256, bool>,
+        // Winner registry (address and amount)
+        winner_record: Map<u256, (ContractAddress, u256)>,
     }
 
     #[constructor]
     fn constructor(ref self: ContractState, owner: ContractAddress) {
         self.owner.write((), owner);
         self.auction_verifier.write(Zero::zero());
+        self.payment_verifier.write(Zero::zero());
     }
 
     #[abi(embed_v0)]
@@ -116,12 +132,10 @@ mod SealedBidFeedlot {
             assert(!lot.finalizado, 'Lot already finalized');
             assert(get_block_timestamp() < lot.start_time + lot.duration, 'Auction ended');
 
-            // Use the transaction's account contract address (supports paymasters)
             let tx_info = get_tx_info().unbox();
             let caller = tx_info.account_contract_address;
             self.commitments.write((caller, lot_id), commitment);
             
-            // Check if bidder already exists in the list
             let count = self.bidders_count.read(lot_id);
             let mut already_exists = false;
             let mut i = 0;
@@ -134,7 +148,6 @@ mod SealedBidFeedlot {
             };
             
             if !already_exists {
-                // Add new bidder
                 self.bidder_at.write((lot_id, count), caller);
                 self.bidders_count.write(lot_id, count + 1);
             }
@@ -146,7 +159,6 @@ mod SealedBidFeedlot {
             assert(!lot.finalizado, 'Lot already finalized');
             assert(get_block_timestamp() < lot.start_time + lot.duration, 'Auction ended');
 
-            // Use the transaction's account contract address
             let tx_info = get_tx_info().unbox();
             let caller = tx_info.account_contract_address;
             let computed_commitment = poseidon_hash_span(
@@ -167,8 +179,19 @@ mod SealedBidFeedlot {
             assert(get_caller_address() == self.owner.read(()), 'Not owner');
             let mut lot = self.lots.read(lot_id);
             assert(!lot.finalizado, 'Already finalized');
+            
+            // Capture winner info before moving lot
+            let winner = lot.mejor_postor;
+            let amount = lot.mejor_puja;
+            
             lot.finalizado = true;
-            self.lots.write(lot_id, lot);
+            self.lots.write(lot_id, lot); // lot is moved here
+            
+            // Register winner if exists
+            if !winner.is_zero() {
+                self.winner_record.write(lot_id, (winner, amount));
+                self.emit(WinnerRecorded { lot_id, winner, amount });
+            }
         }
 
         fn get_winning_bid(self: @ContractState, lot_id: u256) -> u256 {
@@ -191,13 +214,11 @@ mod SealedBidFeedlot {
             self.bidder_at.read((lot_id, index))
         }
 
-        // Set the auction verifier address (owner only)
         fn set_auction_verifier(ref self: ContractState, verifier_address: ContractAddress) {
             assert(get_caller_address() == self.owner.read(()), 'Not owner');
             self.auction_verifier.write(verifier_address);
         }
 
-        // Finalize lot with a ZK proof from the selection circuit
         fn finalize_with_zk(
             ref self: ContractState,
             lot_id: u256,
@@ -205,19 +226,15 @@ mod SealedBidFeedlot {
             winner_amount: u256,
             proof: Span<felt252>
         ) {
-            // Must be owner
             assert(get_caller_address() == self.owner.read(()), 'Not owner');
             
-            // Check lot exists and is not finalized
             let lot = self.lots.read(lot_id);
             assert(!lot.productor.is_zero(), 'Lot does not exist');
             assert(!lot.finalizado, 'Already finalized');
             
-            // Check verifier is set
             let verifier_address = self.auction_verifier.read();
             assert(!verifier_address.is_zero(), 'Verifier not set');
             
-            // Call the verifier contract
             let selector = selector!("verify_ultra_keccak_honk_proof");
             let result = starknet::syscalls::call_contract_syscall(
                 verifier_address,
@@ -225,21 +242,79 @@ mod SealedBidFeedlot {
                 proof
             );
             
-            // If the call fails, the proof is invalid
             match result {
                 Result::Ok(_) => {},
                 Result::Err(_) => assert(false, 'Proof verification failed'),
             };
             
-            // Update lot
             let mut updated_lot = lot;
             updated_lot.finalizado = true;
             updated_lot.mejor_postor = winner;
             updated_lot.mejor_puja = winner_amount;
             self.lots.write(lot_id, updated_lot);
             
-            // Emit event
+            // Register winner (winner and winner_amount are parameters, not moved)
+            self.winner_record.write(lot_id, (winner, winner_amount));
             self.emit(AuctionFinalized { lot_id, winner, winner_amount });
+        }
+
+        fn set_payment_verifier(ref self: ContractState, verifier_address: ContractAddress) {
+            assert(get_caller_address() == self.owner.read(()), 'Not owner');
+            self.payment_verifier.write(verifier_address);
+        }
+
+        fn verify_payment(ref self: ContractState, lot_id: u256, proof: Span<felt252>) {
+            let lot = self.lots.read(lot_id);
+            assert(!lot.productor.is_zero(), 'Lot does not exist');
+            assert(lot.finalizado, 'Lot not finalized');
+            
+            let winner = lot.mejor_postor;
+            assert(get_caller_address() == winner, 'Only winner can pay');
+            assert(!self.payment_done.read(lot_id), 'Payment already done');
+            
+            let verifier = self.payment_verifier.read();
+            assert(!verifier.is_zero(), 'Payment verifier not set');
+            
+            let selector = selector!("verify_ultra_keccak_honk_proof");
+            let result = starknet::syscalls::call_contract_syscall(
+                verifier,
+                selector,
+                proof
+            );
+            
+            match result {
+                Result::Ok(_) => {},
+                Result::Err(_) => assert(false, 'Payment proof failed'),
+            };
+            
+            self.payment_done.write(lot_id, true);
+            self.emit(PaymentVerified { lot_id, winner });
+        }
+
+        fn is_payment_done(self: @ContractState, lot_id: u256) -> bool {
+            self.payment_done.read(lot_id)
+        }
+
+        fn get_winner(self: @ContractState, lot_id: u256) -> (ContractAddress, u256) {
+            self.winner_record.read(lot_id)
+        }
+
+        fn debug_reveal(self: @ContractState, lot_id: u256, amount: u256, nonce: felt252) -> (felt252, felt252, ContractAddress, ContractAddress) {
+            let tx_info = get_tx_info().unbox();
+            let account_address = tx_info.account_contract_address;
+            let caller = get_caller_address();
+            
+            let computed = poseidon_hash_span(
+                array![
+                    nonce,
+                    amount.low.into(),
+                    lot_id.low.into(),
+                    account_address.into()
+                ].span()
+            );
+            let stored = self.commitments.read((account_address, lot_id));
+            
+            (computed, stored, account_address, caller)
         }
     }
 
@@ -247,6 +322,8 @@ mod SealedBidFeedlot {
     #[derive(Drop, starknet::Event)]
     enum Event {
         AuctionFinalized: AuctionFinalized,
+        PaymentVerified: PaymentVerified,
+        WinnerRecorded: WinnerRecorded,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -255,5 +332,20 @@ mod SealedBidFeedlot {
         lot_id: u256,
         winner: ContractAddress,
         winner_amount: u256,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct PaymentVerified {
+        #[key]
+        lot_id: u256,
+        winner: ContractAddress,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct WinnerRecorded {
+        #[key]
+        lot_id: u256,
+        winner: ContractAddress,
+        amount: u256,
     }
 }

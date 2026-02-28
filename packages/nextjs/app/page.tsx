@@ -1,8 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
+/**
+ * Main auction page component.
+ * Handles lot creation, bidding (commit/reveal), ZK finalization, and ZK payment.
+ * Integrates Cavos for social login and uses a backend proof service.
+ */
+
 import { useAccount, useContract, useProvider } from "@starknet-react/core";
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { poseidonHashMany } from "micro-starknet";
 import toast from "react-hot-toast";
 import deployedContracts from "~~/contracts/deployedContracts";
@@ -24,7 +30,7 @@ interface LotMetadata {
   descripcion?: string;
 }
 
-// IPFS Gateway configuration (from environment)
+// IPFS Gateway configuration from environment variables
 const IPFS_GATEWAY = process.env.NEXT_PUBLIC_IPFS_GATEWAY || 'https://gateway.pinata.cloud';
 
 /**
@@ -44,16 +50,18 @@ function toHexAddress(addr: any): string {
 
 /**
  * Normalizes an address by removing leading zeros and ensuring 0x prefix.
- * @param addr - Raw address string
+ * Accepts any type and converts to string first.
+ * @param addr - Raw address value
  * @returns Normalized address string
  */
-function normalizeAddress(addr: string): string {
+function normalizeAddress(addr: any): string {
   if (!addr) return "";
-  const hex = addr.replace("0x", "").replace(/^0+/, "");
+  const addrStr = String(addr);
+  const hex = addrStr.replace("0x", "").replace(/^0+/, "");
   return "0x" + (hex || "0");
 }
 
-// Verifier addresses from environment variables
+// Verifier addresses from environment variables (used for direct calls, but now we call the main contract)
 const VERIFIER_ADDRESS = process.env.NEXT_PUBLIC_PAYMENT_VERIFIER_ADDRESS || '';
 const AUCTION_VERIFIER_ADDRESS = process.env.NEXT_PUBLIC_AUCTION_VERIFIER_ADDRESS || '';
 
@@ -65,27 +73,75 @@ export default function Home() {
   });
   const { provider } = useProvider();
 
-  // Cavos hooks
+  // Cavos social login hooks
   const { 
     address: cavosAddress, 
     isAuthenticated: isCavosAuth, 
     execute: cavosExecute,
-    logout: cavosLogout
+    logout: cavosLogout,
+    walletStatus,
+    registerCurrentSession,
+    updateSessionPolicy
   } = useCavos();
 
   // Unified active account: Cavos takes precedence if authenticated
   const activeAccount = isCavosAuth ? cavosAddress : walletAccount;
   const activeAccountAddress = isCavosAuth ? cavosAddress : walletAccount?.address;
 
+  // Use a ref to keep a stable contract reference (avoid re‑effects)
+  const contractRef = useRef(contract);
+  useEffect(() => {
+    contractRef.current = contract;
+  }, [contract]);
+
   /**
-   * Unified transaction execution function that works with both Cavos and traditional wallets.
+   * Unified transaction execution function.
+   * For Cavos, it includes a retry mechanism that auto‑registers the session if needed.
    * @param call - Transaction call object
    * @returns Object containing transaction hash
    */
   const executeTransaction = async (call: any) => {
     if (isCavosAuth) {
-      const txHash = await cavosExecute(call);
-      return { transaction_hash: txHash };
+      const executeWithRetry = async (): Promise<{ transaction_hash: string }> => {
+        try {
+          const txHash = await cavosExecute(call);
+          return { transaction_hash: txHash };
+        } catch (error: any) {
+          if (error.message?.includes('Session not registered')) {
+            console.log("⚠️ Session not registered, attempting to register now...");
+            toast.loading('Updating policy and registering session...', { id: 'auto-activate' });
+
+            try {
+              if (updateSessionPolicy) {
+                updateSessionPolicy({
+                  allowedContracts: [
+                    process.env.NEXT_PUBLIC_AUCTION_CONTRACT_ADDRESS || '',
+                  ],
+                  spendingLimits: [
+                    {
+                      token: process.env.NEXT_PUBLIC_STRK_TOKEN_ADDRESS || '',
+                      limit: BigInt(1000) * BigInt(10 ** 18),
+                    },
+                  ],
+                  maxCallsPerTx: 10,
+                });
+              }
+
+              await registerCurrentSession();
+              toast.success('Session activated!', { id: 'auto-activate' });
+
+              const txHash = await cavosExecute(call);
+              return { transaction_hash: txHash };
+            } catch (regError: any) {
+              toast.error('Auto-activation failed: ' + regError.message, { id: 'auto-activate' });
+              toast.error('Please use the "Activate" button next to your address and try again.', { id: 'manual-suggest' });
+              throw new Error(`Failed to activate session: ${regError.message}`);
+            }
+          }
+          throw error;
+        }
+      };
+      return await executeWithRetry();
     } else if (walletAccount) {
       const tx = await walletAccount.execute([call]);
       return tx;
@@ -96,10 +152,9 @@ export default function Home() {
 
   const [owner, setOwner] = useState<string | null>(null);
   const [isOwner, setIsOwner] = useState(false);
-
-  // Default producer address (owner)
   const DEFAULT_PRODUCER = "0x0626bb9241ba6334ae978cfce1280d725e727a6acb5e61392ab4cee031a4b7ca";
 
+  // Form fields for lot creation
   const [newProductor, setNewProductor] = useState(DEFAULT_PRODUCER);
   const [newRaza, setNewRaza] = useState("");
   const [newPeso, setNewPeso] = useState("");
@@ -116,6 +171,7 @@ export default function Home() {
   const [selectedLotMetadata, setSelectedLotMetadata] = useState<LotMetadata | null>(null);
   const [currentTime, setCurrentTime] = useState(Math.floor(Date.now() / 1000));
 
+  // Bidding state
   const [amount, setAmount] = useState("");
   const [nonce, setNonce] = useState(Math.floor(Math.random() * 1000000).toString());
   const [isLoading, setIsLoading] = useState(false);
@@ -124,9 +180,69 @@ export default function Home() {
   const [commitment, setCommitment] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
 
+  // Per‑account persistent states (partially from localStorage)
   const [participatedLotes, setParticipatedLotes] = useState<Record<string, boolean>>({});
   const [proofGeneratedLotes, setProofGeneratedLotes] = useState<Record<string, boolean>>({});
   const [zkFinalizedLotes, setZkFinalizedLotes] = useState<Record<string, boolean>>({});
+  const [debugData, setDebugData] = useState<any>(null);
+
+  // ---------- Helper function: check if a user has already bid in a lot (on‑chain) ----------
+  const checkIfUserParticipated = useCallback(async (lotId: string, userAddress: string): Promise<boolean> => {
+    if (!contractRef.current || !userAddress) return false;
+    try {
+      const count = await contractRef.current.get_bidders_count(lotId);
+      const countNum = Number(count);
+      const userHex = toHexAddress(userAddress).toLowerCase();
+      for (let i = 0; i < countNum; i++) {
+        const bidder = await contractRef.current.get_bidder_at(lotId, i);
+        const bidderHex = toHexAddress(bidder).toLowerCase();
+        if (bidderHex === userHex) {
+          return true;
+        }
+      }
+      return false;
+    } catch (error) {
+      console.error("Error checking participation:", error);
+      return false;
+    }
+  }, []); // No dependencies: uses contractRef
+
+  // ---------- Effect: verify participation and restore committed from localStorage ----------
+  useEffect(() => {
+    if (!activeAccountAddress || !selectedLotId) return;
+    const verifyAndRestore = async () => {
+      const participated = await checkIfUserParticipated(selectedLotId, activeAccountAddress);
+      setParticipatedLotes(prev => ({ ...prev, [selectedLotId]: participated }));
+
+      const winnerAddrFormatted = toHexAddress(activeAccountAddress).toLowerCase();
+      const key = `zk_${selectedLotId}_${winnerAddrFormatted}`;
+      const storedData = localStorage.getItem(key);
+      // Restore committed only if the account really participated on‑chain
+      if (storedData && participated) {
+        const bid = JSON.parse(storedData);
+        setCommitted(true);
+        setAmount(bid.amount);
+        setNonce(bid.secret);
+        setCommitment(bid.commitment);
+      } else {
+        setCommitted(false);
+        setAmount("");
+        setNonce(Math.floor(Math.random() * 1000000).toString());
+        setCommitment("");
+      }
+    };
+    verifyAndRestore();
+  }, [activeAccountAddress, selectedLotId, checkIfUserParticipated]);
+
+  // ---------- Effect: clear all account‑specific states when switching accounts ----------
+  useEffect(() => {
+    setParticipatedLotes({});
+    setCommitted(false);
+    setRevealed(false);
+    setCommitment("");
+    setAmount("");
+    setNonce(Math.floor(Math.random() * 1000000).toString());
+  }, [activeAccountAddress]);
 
   /**
    * Computes the Poseidon commitment for a bid.
@@ -150,7 +266,7 @@ export default function Home() {
   };
 
   /**
-   * Computes the commitment preview for the UI.
+   * Computes the commitment preview for the UI (only before commit).
    */
   const calculatedCommitment = useMemo(() => {
     if (!amount || !nonce || committed) return "";
@@ -164,18 +280,14 @@ export default function Home() {
     }
   }, [amount, nonce, committed]);
 
-  // Load per‑account data from localStorage
+  // Load per‑account data from localStorage for proofGenerated and zkFinalized (these are less critical)
   useEffect(() => {
     if (!activeAccountAddress) {
-      setParticipatedLotes({});
       setProofGeneratedLotes({});
       setZkFinalizedLotes({});
       return;
     }
     const accountKey = activeAccountAddress.toLowerCase();
-
-    const savedParticipated = localStorage.getItem(`participatedLotes_${accountKey}`);
-    setParticipatedLotes(savedParticipated ? JSON.parse(savedParticipated) : {});
 
     const savedProofGenerated = localStorage.getItem(`proofGeneratedLotes_${accountKey}`);
     setProofGeneratedLotes(savedProofGenerated ? JSON.parse(savedProofGenerated) : {});
@@ -184,13 +296,7 @@ export default function Home() {
     setZkFinalizedLotes(savedZkFinalized ? JSON.parse(savedZkFinalized) : {});
   }, [activeAccountAddress]);
 
-  // Save per‑account data
-  useEffect(() => {
-    if (!activeAccountAddress) return;
-    const accountKey = activeAccountAddress.toLowerCase();
-    localStorage.setItem(`participatedLotes_${accountKey}`, JSON.stringify(participatedLotes));
-  }, [participatedLotes, activeAccountAddress]);
-
+  // Save per‑account data (only proofGenerated and zkFinalized)
   useEffect(() => {
     if (!activeAccountAddress) return;
     const accountKey = activeAccountAddress.toLowerCase();
@@ -203,7 +309,7 @@ export default function Home() {
     localStorage.setItem(`zkFinalizedLotes_${accountKey}`, JSON.stringify(zkFinalizedLotes));
   }, [zkFinalizedLotes, activeAccountAddress]);
 
-  // Clock
+  // Clock for auction countdown
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTime(Math.floor(Date.now() / 1000));
@@ -211,41 +317,41 @@ export default function Home() {
     return () => clearInterval(timer);
   }, []);
 
-  // Owner check
+  // Owner check: compare active account with configured owner address
   useEffect(() => {
     if (activeAccountAddress) {
       const ownerAddress = (process.env.NEXT_PUBLIC_OWNER_ADDRESS || DEFAULT_PRODUCER).toLowerCase();
       setOwner(ownerAddress);
-      const normalizedAccount = normalizeAddress(activeAccountAddress);
-      const normalizedOwner = normalizeAddress(ownerAddress);
+      const normalizedAccount = toHexAddress(activeAccountAddress).toLowerCase();
+      const normalizedOwner = toHexAddress(ownerAddress).toLowerCase();
       setIsOwner(normalizedAccount === normalizedOwner);
     } else {
       setIsOwner(false);
     }
   }, [activeAccountAddress]);
 
-  /**
-   * Fetches all lots from the contract.
-   * @param showRefreshing - Whether to show the refreshing spinner
-   */
+  // ---------- Fetch all lots from contract, including participation, payment status, and winner record ----------
   const fetchAllLots = useCallback(async (showRefreshing = false) => {
-    if (!contract) return;
+    if (!contractRef.current) return;
     if (showRefreshing) setRefreshing(true);
     else setLoadingLots(true);
     try {
-      const count = await contract.get_lot_count();
+      const count = await contractRef.current.get_lot_count();
       const num = Number(count);
       setNextLotId(String(num + 1));
+
       const lotsArray = [];
+      const participationPromises = [];
+
       for (let i = 1; i <= num; i++) {
         try {
-          const info = await contract.get_lot_info(i);
+          const info = await contractRef.current.get_lot_info(i);
           let metadata = null;
           const metadataUri = info.metadata_uri ? info.metadata_uri.toString() : "";
 
           if (metadataUri.startsWith("ipfs://")) {
             const cid = metadataUri.replace("ipfs://", "");
-            const gatewayUrl = `${IPFS_GATEWAY}/ipfs/${cid}`; // Use configured gateway
+            const gatewayUrl = `${IPFS_GATEWAY}/ipfs/${cid}`;
             try {
               const res = await fetch(gatewayUrl);
               if (res.ok) metadata = await res.json();
@@ -256,6 +362,29 @@ export default function Home() {
 
           const productorHex = toHexAddress(info.productor);
           const mejorPostorHex = toHexAddress(info.mejor_postor);
+          
+          let paymentDone = false;
+          let winnerRecord = null;
+
+          if (info.finalizado) {
+            try {
+              paymentDone = await contractRef.current.is_payment_done(i);
+            } catch (e) {
+              console.error(`Error checking payment status for lot ${i}:`, e);
+            }
+            // Fetch winner record for finalized lots (only once)
+            try {
+              const winnerData = await contractRef.current.get_winner(i);
+              if (winnerData && winnerData[0] && winnerData[1] !== undefined) {
+                winnerRecord = {
+                  address: toHexAddress(winnerData[0]),
+                  amount: winnerData[1].toString(),
+                };
+              }
+            } catch (e) {
+              console.error(`Error fetching winner for lot ${i}:`, e);
+            }
+          }
 
           lotsArray.push({
             id: i,
@@ -270,12 +399,32 @@ export default function Home() {
             mejor_puja: info.mejor_puja?.toString() || "0",
             mejor_postor: mejorPostorHex,
             metadata,
+            paymentDone,
+            winnerRecord, // stored directly in the lot object
           });
+
+          if (activeAccountAddress) {
+            participationPromises.push(
+              checkIfUserParticipated(i.toString(), activeAccountAddress)
+                .then(participated => ({ lotId: i.toString(), participated }))
+                .catch(() => ({ lotId: i.toString(), participated: false }))
+            );
+          }
         } catch (e) {
           console.error(`Error fetching lot ${i}:`, e);
         }
       }
+
       setLots(lotsArray);
+
+      if (activeAccountAddress && participationPromises.length > 0) {
+        const results = await Promise.all(participationPromises);
+        const newParticipated: Record<string, boolean> = {};
+        results.forEach(({ lotId, participated }) => {
+          newParticipated[lotId] = participated;
+        });
+        setParticipatedLotes(newParticipated);
+      }
     } catch (e) {
       console.error("Error in fetchAllLots:", e);
       toast.error("Failed to load lots");
@@ -283,11 +432,11 @@ export default function Home() {
       setLoadingLots(false);
       setRefreshing(false);
     }
-  }, [contract, setRefreshing, setLoadingLots, setNextLotId, setLots, toHexAddress, toast, IPFS_GATEWAY]);
+  }, [activeAccountAddress, checkIfUserParticipated]);
 
   useEffect(() => {
     fetchAllLots();
-  }, [fetchAllLots, contract, activeAccountAddress]); // Added fetchAllLots to dependencies
+  }, [fetchAllLots, activeAccountAddress]);
 
   /**
    * Handles selection of a lot.
@@ -297,11 +446,8 @@ export default function Home() {
     setSelectedLotId(lot.id.toString());
     setSelectedLotInfo(lot);
     setSelectedLotMetadata(lot.metadata);
-    setCommitted(false);
-    setRevealed(false);
-    setCommitment("");
-    setAmount("");
-    setNonce(Math.floor(Math.random() * 1000000).toString());
+    setDebugData(null);
+    setRevealed(false); // reset reveal status (will be restored by effect if needed)
   };
 
   /**
@@ -359,19 +505,18 @@ export default function Home() {
    */
   const handleCreateLot = async () => {
     setErrorMessage("");
-    if (!contract || !activeAccount) return;
+    if (!contractRef.current || !activeAccount) return;
     if (!isOwner) {
       setErrorMessage("❌ Only the owner can create lots");
       return;
     }
     setIsLoading(true);
     try {
-      // Prepend ipfs:// to the hash if not already present
       const metadataUri = newMetadataHash.startsWith("ipfs://") 
         ? newMetadataHash 
         : `ipfs://${newMetadataHash}`;
 
-      const call = contract.populate("create_lot", [
+      const call = contractRef.current.populate("create_lot", [
         BigInt(nextLotId),
         newProductor,
         newRaza,
@@ -383,7 +528,6 @@ export default function Home() {
       const tx = await executeTransaction(call);
       await provider.waitForTransaction(tx.transaction_hash);
       toast.success("✅ Lot created successfully");
-      // Reset form (keep default producer)
       setNewProductor(DEFAULT_PRODUCER);
       setNewRaza("");
       setNewPeso("");
@@ -404,13 +548,46 @@ export default function Home() {
    */
   const handleCommit = async () => {
     setErrorMessage("");
-    if (!contract || !activeAccountAddress || !selectedLotId) return;
+    if (!contractRef.current || !activeAccountAddress || !selectedLotId) return;
     if (!isAuctionActive(selectedLotInfo)) {
       toast.error("❌ Auction is not active");
       return;
     }
+
     setIsLoading(true);
+
+    const waitForSessionReady = async (timeout = 15000): Promise<boolean> => {
+      if (!isCavosAuth) return true;
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        if (walletStatus?.isReady) {
+          console.log("✅ Session ready after", Date.now() - start, "ms");
+          return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      return false;
+    };
+
     try {
+      if (isCavosAuth) {
+        const ready = await waitForSessionReady();
+        if (!ready) {
+          toast.loading("Activating session on‑chain...", { id: 'session-act' });
+          try {
+            await registerCurrentSession();
+            toast.dismiss('session-act');
+            const readyAfterReg = await waitForSessionReady(5000);
+            if (!readyAfterReg) {
+              throw new Error("Session still not ready after registration");
+            }
+          } catch (regError: any) {
+            toast.dismiss('session-act');
+            throw new Error(`Failed to activate session: ${regError.message}`);
+          }
+        }
+      }
+
       const secretBig = BigInt(nonce);
       const amountBig = BigInt(amount);
       const lotIdBig = BigInt(selectedLotId);
@@ -442,16 +619,24 @@ export default function Home() {
       });
       localStorage.setItem(bidsKey, JSON.stringify(currentBids));
 
-      const call = contract.populate("commit_bid", [selectedLotId, poseidonCommitment]);
+      const call = contractRef.current.populate("commit_bid", [selectedLotId, poseidonCommitment]);
       const tx = await executeTransaction(call);
       await provider.waitForTransaction(tx.transaction_hash);
 
+      const receipt: any = await provider.getTransactionReceipt(tx.transaction_hash);
+      if (receipt.execution_status !== 'SUCCEEDED') {
+        throw new Error(`Commit transaction failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
+      }
+
       setCommitment(poseidonCommitment);
       setCommitted(true);
+      const participated = await checkIfUserParticipated(selectedLotId, activeAccountAddress);
+      setParticipatedLotes(prev => ({ ...prev, [selectedLotId]: participated }));
       toast.success("✅ Commit successful. Now reveal.");
     } catch (e: any) {
       console.error("Error in commit:", e);
       toast.error("❌ Commit failed: " + (e.message || JSON.stringify(e)));
+      setCommitted(false);
     } finally {
       setIsLoading(false);
     }
@@ -462,7 +647,7 @@ export default function Home() {
    */
   const handleReveal = async () => {
     setErrorMessage("");
-    if (!contract || !activeAccountAddress || !selectedLotId) return;
+    if (!contractRef.current || !activeAccountAddress || !selectedLotId) return;
     if (!isAuctionActive(selectedLotInfo)) {
       toast.error("❌ Auction is not active");
       return;
@@ -514,7 +699,7 @@ export default function Home() {
         nonceHex
       ];
       const call = {
-        contractAddress: contract.address,
+        contractAddress: contractRef.current.address,
         entrypoint: 'reveal_bid',
         calldata: calldataHex,
       };
@@ -531,9 +716,17 @@ export default function Home() {
       }
 
       await provider.waitForTransaction(txHash);
+
+      const receipt: any = await provider.getTransactionReceipt(txHash);
+      if (receipt.execution_status !== 'SUCCEEDED') {
+        throw new Error(`Reveal transaction failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
+      }
+
+      localStorage.removeItem(key); // data no longer needed after successful reveal
+
       toast.success("✅ Bid revealed");
 
-      const updatedInfo = await contract.get_lot_info(selectedLotId);
+      const updatedInfo = await contractRef.current.get_lot_info(selectedLotId);
       const updatedLot = {
         id: selectedLotInfo.id,
         productor: toHexAddress(updatedInfo.productor),
@@ -555,15 +748,109 @@ export default function Home() {
       setRevealed(true);
     } catch (e: any) {
       console.error("Error in reveal:", e);
+      
+      if (e.message?.includes("Commitment mismatch") || e.message?.includes("commitment")) {
+        try {
+          const winnerAddrFormatted = toHexAddress(activeAccountAddress).toLowerCase();
+          const key = `zk_${selectedLotId}_${winnerAddrFormatted}`;
+          const storedData = localStorage.getItem(key);
+          if (storedData) {
+            const bid = JSON.parse(storedData);
+            const debugResult = await contractRef.current.debug_reveal(selectedLotId, bid.amount, bid.secret);
+            console.log("🔍 DEBUG REVEAL DATA:", debugResult);
+            
+            const [computed, stored, accountAddress, caller] = debugResult;
+            const debugInfo = {
+              computed: computed.toString(),
+              stored: stored.toString(),
+              accountAddress: toHexAddress(accountAddress),
+              caller: toHexAddress(caller),
+              lotId: selectedLotId,
+              amount: bid.amount,
+              nonce: bid.secret
+            };
+            setDebugData(debugInfo);
+            
+            toast.error(
+              <div className="text-xs">
+                <p>❌ Commitment mismatch</p>
+                <p>Computed: {debugInfo.computed.slice(0, 10)}...</p>
+                <p>Stored: {debugInfo.stored.slice(0, 10)}...</p>
+                <p>Account: {debugInfo.accountAddress.slice(0, 10)}...</p>
+                <p>Caller: {debugInfo.caller.slice(0, 10)}...</p>
+                <p>Check console for full details</p>
+              </div>,
+              { duration: 10000 }
+            );
+          } else {
+            console.error("No stored data for debug");
+          }
+        } catch (debugErr) {
+          console.error("Failed to get debug info:", debugErr);
+        }
+      }
+      
       toast.error("❌ Reveal failed: " + (e.message || JSON.stringify(e)));
+      setRevealed(false);
     } finally {
       setIsLoading(false);
     }
   };
 
   /**
-   * Dynamic ZK proof generation for payment.
-   * Fetches the winning bid from localStorage and requests calldata from the backend.
+   * Manual debug function to call debug_reveal for troubleshooting.
+   */
+  const handleDebugReveal = async () => {
+    if (!contractRef.current || !selectedLotId || !amount || !nonce) {
+      toast.error("Missing data for debug");
+      return;
+    }
+    try {
+      toast.loading("Calling debug_reveal...");
+      const debugResult = await contractRef.current.debug_reveal(selectedLotId, amount, nonce);
+      const [computed, stored, accountAddress, caller] = debugResult;
+      const debugInfo = {
+        computed: computed.toString(),
+        stored: stored.toString(),
+        accountAddress: toHexAddress(accountAddress),
+        caller: toHexAddress(caller),
+        lotId: selectedLotId,
+        amount,
+        nonce
+      };
+      setDebugData(debugInfo);
+      console.log("🔍 MANUAL DEBUG REVEAL DATA:", debugInfo);
+      toast.dismiss();
+      toast.success("Debug data obtained (see console)");
+      
+      const message = `
+Computed: ${debugInfo.computed}
+Stored: ${debugInfo.stored}
+Account: ${debugInfo.accountAddress}
+Caller: ${debugInfo.caller}
+      `;
+      toast.custom(
+        <div className="bg-gray-800 text-white p-4 rounded-lg max-w-md overflow-auto text-xs">
+          <pre>{message}</pre>
+          <button 
+            className="mt-2 btn btn-sm btn-primary"
+            onClick={() => navigator.clipboard.writeText(JSON.stringify(debugInfo, null, 2))}
+          >
+            Copy to clipboard
+          </button>
+        </div>,
+        { duration: 15000 }
+      );
+    } catch (error) {
+      console.error("Debug error:", error);
+      toast.error("Debug failed");
+    }
+  };
+
+  /**
+   * ZK payment verification.
+   * Fetches the winning bid from localStorage, generates proof via backend,
+   * and calls verify_payment on the main contract.
    */
   const handleZKProof = async () => {
     if (!activeAccountAddress || !selectedLotInfo || !selectedLotInfo.finalizado) return;
@@ -572,7 +859,6 @@ export default function Home() {
       return;
     }
 
-    // Retrieve all bids for this lot from localStorage
     const allBids: Bid[] = JSON.parse(
       localStorage.getItem(`bids_${selectedLotId}`) || '[]'
     );
@@ -581,7 +867,6 @@ export default function Home() {
       return;
     }
 
-    // Find the bid belonging to the current winner
     const winningBid = allBids.find(
       bid => normalizeAddress(bid.winner) === normalizeAddress(activeAccountAddress)
     );
@@ -611,38 +896,42 @@ export default function Home() {
       console.log("✅ Payment calldata received, length:", calldata.length);
       toast.dismiss();
 
-      toast.loading("Verifying payment proof on-chain...");
+      toast.loading("Verifying payment on contract...");
+      console.log("⛓️ Calling verify_payment...");
+
+      const call = contractRef.current.populate("verify_payment", [
+        selectedLotId,
+        calldata.map(c => c.toString())
+      ]);
+
       let txHash: string;
       if (isCavosAuth) {
-        txHash = await cavosExecute({
-          contractAddress: VERIFIER_ADDRESS,
-          entrypoint: "verify_ultra_keccak_honk_proof",
-          calldata: calldata.map(c => c.toString()),
-        });
+        txHash = await cavosExecute(call);
       } else if (walletAccount) {
-        const tx = await walletAccount.execute({
-          contractAddress: VERIFIER_ADDRESS,
-          entrypoint: "verify_ultra_keccak_honk_proof",
-          calldata: calldata.map(c => c.toString()),
-        });
+        const tx = await walletAccount.execute([call]);
         txHash = tx.transaction_hash;
       } else {
         throw new Error("No account connected");
       }
 
-      console.log("⛓️ Payment tx hash:", txHash);
+      console.log("⛓️ verify_payment tx hash:", txHash);
       await provider.waitForTransaction(txHash);
 
       const receipt: any = await provider.getTransactionReceipt(txHash);
-      console.log("📄 Payment receipt:", receipt);
+      console.log("📄 verify_payment receipt:", receipt);
       if (receipt.execution_status !== 'SUCCEEDED') {
-        throw new Error(`Payment verification failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
+        throw new Error(`verify_payment failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
       }
 
       toast.dismiss();
-      toast.success("✅ Payment proof verified on‑chain");
+      toast.success("✅ Payment verified on‑chain");
       setProofGeneratedLotes(prev => ({ ...prev, [selectedLotId]: true }));
       localStorage.setItem(`proof_tx_${selectedLotId}`, txHash);
+
+      const paymentDone = await contractRef.current.is_payment_done(selectedLotId);
+      console.log("Payment done status:", paymentDone);
+      
+      await fetchAllLots(true);
     } catch (error: any) {
       console.error("❌ Payment verification error:", error);
       toast.dismiss();
@@ -666,12 +955,13 @@ export default function Home() {
 
   /**
    * Finalizes a lot using a dynamic ZK proof (owner only).
+   * Calls finalize_with_zk on the main contract.
    */
   const handleFinalizeWithZK = async () => {
     console.log("🚀 handleFinalizeWithZK started");
     
-    if (!contract || !activeAccountAddress || !selectedLotId || !selectedLotInfo) {
-      console.log("❌ Missing data", { contract, activeAccountAddress, selectedLotId, selectedLotInfo });
+    if (!contractRef.current || !activeAccountAddress || !selectedLotId || !selectedLotInfo) {
+      console.log("❌ Missing data", { contractRef, activeAccountAddress, selectedLotId, selectedLotInfo });
       return;
     }
     if (!isOwner) {
@@ -717,63 +1007,46 @@ export default function Home() {
       console.log("✅ Calldata received, length:", calldata.length);
       toast.dismiss();
 
-      toast.loading("Verifying ZK proof on-chain...");
-      console.log("⛓️ Sending verification transaction...");
+      const winner = selectedLotInfo.mejor_postor;
+      const winnerAmount = selectedLotInfo.mejor_puja;
+
+      if (!winner || winner === '0x0' || winnerAmount === '0') {
+        throw new Error("No winner determined yet");
+      }
+
+      toast.loading("Submitting ZK proof to contract...");
+      console.log("⛓️ Calling finalize_with_zk...");
       
+      const call = contractRef.current.populate("finalize_with_zk", [
+        selectedLotId,
+        winner,
+        winnerAmount,
+        calldata.map(c => c.toString())
+      ]);
+
       let txHash: string;
       if (isCavosAuth) {
-        txHash = await cavosExecute({
-          contractAddress: AUCTION_VERIFIER_ADDRESS,
-          entrypoint: "verify_ultra_keccak_honk_proof",
-          calldata: calldata.map(c => c.toString()),
-        });
+        txHash = await cavosExecute(call);
       } else if (walletAccount) {
-        const tx = await walletAccount.execute({
-          contractAddress: AUCTION_VERIFIER_ADDRESS,
-          entrypoint: "verify_ultra_keccak_honk_proof",
-          calldata: calldata.map(c => c.toString()),
-        });
+        const tx = await walletAccount.execute([call]);
         txHash = tx.transaction_hash;
       } else {
         throw new Error("No account connected");
       }
 
-      console.log("⛓️ Verification tx hash:", txHash);
+      console.log("⛓️ finalize_with_zk tx hash:", txHash);
       await provider.waitForTransaction(txHash);
 
       const receipt: any = await provider.getTransactionReceipt(txHash);
-      console.log("📄 Verification receipt:", receipt);
+      console.log("📄 finalize_with_zk receipt:", receipt);
       if (receipt.execution_status !== 'SUCCEEDED') {
-        throw new Error(`Verification failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
+        throw new Error(`finalize_with_zk failed: ${receipt.execution_status} - ${receipt.revert_reason || 'unknown'}`);
       }
-      
+
       toast.dismiss();
-      toast.success("✅ ZK proof verified on‑chain (dynamic)");
+      toast.success("✅ Lot finalized with ZK proof!");
 
-      toast.loading("Waiting for finalization confirmation...");
-      console.log("⛓️ Preparing finalize_lot...");
-      const call = contract.populate("finalize_lot", [selectedLotId]);
-      console.log("Call to execute:", call);
-
-      let tx2;
-      try {
-        tx2 = await executeTransaction(call);
-      } catch (execError: any) {
-        console.error("❌ Error executing finalize_lot:", execError);
-        throw new Error(`Error sending finalize_lot: ${execError.message}`);
-      }
-
-      console.log("⛓️ Finalization tx hash:", tx2.transaction_hash);
-      await provider.waitForTransaction(tx2.transaction_hash);
-
-      const receipt2: any = await provider.getTransactionReceipt(tx2.transaction_hash);
-      console.log("📄 Finalization receipt:", receipt2);
-      if (receipt2.execution_status !== 'SUCCEEDED') {
-        throw new Error(`Finalize failed: ${receipt2.execution_status} - ${receipt2.revert_reason || 'unknown'}`);
-      }
-
-      console.log("🔄 Updating lot information...");
-      const updatedInfo = await contract.get_lot_info(selectedLotId);
+      const updatedInfo = await contractRef.current.get_lot_info(selectedLotId);
       const updatedLot = {
         id: selectedLotInfo.id,
         productor: toHexAddress(updatedInfo.productor),
@@ -787,15 +1060,17 @@ export default function Home() {
         mejor_puja: updatedInfo.mejor_puja?.toString() || "0",
         mejor_postor: toHexAddress(updatedInfo.mejor_postor),
         metadata: selectedLotInfo.metadata,
+        paymentDone: false,
       };
-      console.log("✅ Lot updated:", updatedLot);
       setSelectedLotInfo(updatedLot);
+
+      const winnerRecord = await contractRef.current.get_winner(selectedLotId);
+      console.log("Winner record:", winnerRecord);
 
       await fetchAllLots(true);
       setZkFinalizedLotes(prev => ({ ...prev, [selectedLotId]: true }));
 
-      localStorage.setItem(`proof_tx_${selectedLotId}`, txHash);
-      localStorage.setItem(`finalize_tx_${selectedLotId}`, tx2.transaction_hash);
+      localStorage.setItem(`finalize_tx_${selectedLotId}`, txHash);
 
       console.log(`✅ Process completed in ${(Date.now() - startTime) / 1000}s`);
       toast.dismiss();
@@ -819,7 +1094,6 @@ export default function Home() {
 
   const userHasParticipated = participatedLotes[selectedLotId];
   const hasGeneratedProof = proofGeneratedLotes[selectedLotId];
-
   const finalizeTxHash = selectedLotId ? localStorage.getItem(`finalize_tx_${selectedLotId}`) : null;
 
   return (
@@ -959,9 +1233,10 @@ export default function Home() {
                   const razaNombre = getRazaNombre(lot.raza);
                   const esGanador =
                     lot.finalizado &&
-                    normalizeAddress(lot.mejor_postor) === normalizeAddress(activeAccountAddress);
+                    toHexAddress(lot.mejor_postor).toLowerCase() === toHexAddress(activeAccountAddress).toLowerCase();
                   const proofGenerated = esGanador && proofGeneratedLotes[lot.id.toString()];
                   const zkFinalized = zkFinalizedLotes[lot.id.toString()];
+                  const paid = lot.paymentDone;
 
                   return (
                     <tr
@@ -986,7 +1261,9 @@ export default function Home() {
                       </td>
                       <td className="hidden lg:table-cell">🔒</td>
                       <td>
-                        {proofGenerated ? (
+                        {paid ? (
+                          <span className="badge badge-success badge-sm md:badge-md">Paid</span>
+                        ) : proofGenerated ? (
                           <span className="badge badge-success badge-sm md:badge-md">ZK Proof</span>
                         ) : esGanador ? (
                           <span className="badge badge-warning badge-sm md:badge-md">Pending</span>
@@ -1092,6 +1369,16 @@ export default function Home() {
             )}
           </div>
 
+          {/* Display winner record from lot object (already fetched) */}
+          {selectedLotInfo.winnerRecord && (
+            <div className="text-sm mt-2">
+              <strong>Registered winner:</strong>{" "}
+              <span className="tooltip" data-tip={selectedLotInfo.winnerRecord.address}>
+                {selectedLotInfo.winnerRecord.address.slice(0, 10)}... ({selectedLotInfo.winnerRecord.amount} STRK)
+              </span>
+            </div>
+          )}
+
           {isOwner && !selectedLotInfo.finalizado && (
             <button
               className="btn btn-success w-full mb-4"
@@ -1102,88 +1389,116 @@ export default function Home() {
             </button>
           )}
 
-          {userHasParticipated ? (
-            <div className="alert alert-info mb-4">
-              You have already placed a bid in this lot. You cannot bid again.
-            </div>
-          ) : isAuctionActive(selectedLotInfo) && !selectedLotInfo.finalizado ? (
-            <div className="space-y-4">
-              <input
-                type="number"
-                className="input input-bordered w-full"
-                placeholder="Bid amount (integer)"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                step="1"
-                disabled={committed}
-              />
+          {isAuctionActive(selectedLotInfo) && !selectedLotInfo.finalizado ? (
+            <>
+              {!committed ? (
+                <div className="space-y-4">
+                  <input
+                    type="number"
+                    className="input input-bordered w-full"
+                    placeholder="Bid amount (integer)"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    step="1"
+                    disabled={committed}
+                  />
 
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  className="input input-bordered flex-1"
-                  placeholder="Nonce (secret)"
-                  value={nonce}
-                  onChange={(e) => setNonce(e.target.value)}
-                  disabled={committed}
-                />
-                {!committed && (
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      className="input input-bordered flex-1"
+                      placeholder="Nonce (secret)"
+                      value={nonce}
+                      onChange={(e) => setNonce(e.target.value)}
+                      disabled={committed}
+                    />
+                    {!committed && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => setNonce(Math.floor(Math.random() * 1000000).toString())}
+                      >
+                        🎲
+                      </button>
+                    )}
+                  </div>
+
+                  {calculatedCommitment && !committed && (
+                    <div className="alert alert-info text-xs break-all">
+                      <strong>Commitment to send (micro‑starknet):</strong> {calculatedCommitment}
+                    </div>
+                  )}
+
+                  {commitment && committed && (
+                    <div className="alert alert-success text-xs break-all">
+                      <strong>Commitment sent (Poseidon):</strong> {commitment}
+                    </div>
+                  )}
+
                   <button
-                    className="btn btn-secondary"
-                    onClick={() => setNonce(Math.floor(Math.random() * 1000000).toString())}
+                    className="btn btn-primary w-full"
+                    onClick={handleCommit}
+                    disabled={isLoading || !amount || committed}
                   >
-                    🎲
+                    {isLoading ? "Sending..." : "1. Send Commit"}
                   </button>
-                )}
-              </div>
+                </div>
+              ) : !revealed ? (
+                <div className="space-y-4">
+                  <input
+                    type="text"
+                    className="input input-bordered w-full bg-gray-100"
+                    placeholder="Nonce (reveal)"
+                    value={nonce}
+                    readOnly
+                    disabled
+                  />
 
-              {calculatedCommitment && !committed && (
-                <div className="alert alert-info text-xs break-all">
-                  <strong>Commitment to send (micro‑starknet):</strong> {calculatedCommitment}
+                  <button
+                    className="btn btn-secondary w-full"
+                    onClick={handleReveal}
+                    disabled={isLoading}
+                  >
+                    {isLoading ? "Revealing..." : "2. Reveal Bid"}
+                  </button>
+
+                  {committed && !revealed && (
+                    <button
+                      className="btn btn-ghost btn-sm w-full mt-2"
+                      onClick={handleDebugReveal}
+                      disabled={isLoading}
+                    >
+                      🔍 Debug Reveal (check commitment)
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="alert alert-info mb-4">
+                  You have already revealed your bid. Wait for the auction to end.
                 </div>
               )}
-
-              {commitment && committed && (
-                <div className="alert alert-success text-xs break-all">
-                  <strong>Commitment sent (Poseidon):</strong> {commitment}
-                </div>
-              )}
-
-              <button
-                className="btn btn-primary w-full"
-                onClick={handleCommit}
-                disabled={isLoading || !amount || committed}
-              >
-                {isLoading ? "Sending..." : "1. Send Commit"}
-              </button>
-
-              <input
-                type="text"
-                className="input input-bordered w-full bg-gray-100"
-                placeholder="Nonce (reveal)"
-                value={nonce}
-                readOnly
-                disabled={!committed}
-              />
-
-              <button
-                className="btn btn-secondary w-full"
-                onClick={handleReveal}
-                disabled={isLoading || !amount || !committed || revealed}
-              >
-                {isLoading ? "Sending..." : "2. Reveal Bid"}
-              </button>
-            </div>
+            </>
           ) : !isAuctionActive(selectedLotInfo) && !selectedLotInfo.finalizado ? (
             <div className="alert alert-warning">
               Bidding time has expired. Wait for the owner to finalize the auction.
             </div>
           ) : null}
 
-          {/* ZK proof button – only for winner if not generated */}
+          {debugData && (
+            <div className="alert alert-info mt-4 overflow-auto max-h-64 text-xs">
+              <strong>Debug Data:</strong>
+              <pre className="mt-2">{JSON.stringify(debugData, null, 2)}</pre>
+              <button
+                className="btn btn-xs btn-primary mt-2"
+                onClick={() => navigator.clipboard.writeText(JSON.stringify(debugData, null, 2))}
+              >
+                Copy to clipboard
+              </button>
+            </div>
+          )}
+
           {selectedLotInfo.finalizado &&
             normalizeAddress(selectedLotInfo.mejor_postor) === normalizeAddress(activeAccountAddress) &&
-            !hasGeneratedProof && (
+            !hasGeneratedProof && !selectedLotInfo.paymentDone && (
               <button
                 className="btn btn-primary w-full mt-4"
                 onClick={handleZKProof}
@@ -1193,24 +1508,20 @@ export default function Home() {
               </button>
             )}
 
-          {/* Proof generated message with link to Voyager (for winner) */}
           {selectedLotInfo.finalizado &&
             normalizeAddress(selectedLotInfo.mejor_postor) === normalizeAddress(activeAccountAddress) &&
-            hasGeneratedProof && (
+            hasGeneratedProof && !selectedLotInfo.paymentDone && (
               <div className="alert alert-success mt-4">
-                ✅ Payment verified on‑chain.{" "}
-                <a
-                  href={`https://sepolia.voyager.online/tx/${localStorage.getItem(`proof_tx_${selectedLotId}`)}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline text-blue-600 hover:text-blue-800"
-                >
-                  {localStorage.getItem(`proof_tx_${selectedLotId}`)?.slice(0, 10)}...
-                </a>
+                ✅ Payment proof generated, waiting for confirmation? This may take a moment.
               </div>
             )}
 
-          {/* Finalization transaction link for the owner */}
+          {selectedLotInfo.paymentDone && (
+            <div className="alert alert-success mt-4">
+              ✅ Payment verified on‑chain.
+            </div>
+          )}
+
           {isOwner && finalizeTxHash && (
             <div className="alert alert-info mt-4">
               ✅ Lot finalized on‑chain.{" "}

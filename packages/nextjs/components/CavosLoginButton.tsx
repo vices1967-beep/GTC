@@ -1,143 +1,86 @@
 'use client';
 
 import { useCavos } from '@cavos/react';
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import toast from 'react-hot-toast';
-import deployedContracts from "~~/contracts/deployedContracts";
 
 interface CavosLoginButtonProps {
-  disabled?: boolean; // Ahora lo usaremos para deshabilitar cuando wallet esté conectada
+  disabled?: boolean; // Prop opcional, de tipo booleano
 }
 
-export const CavosLoginButton = ({ disabled }: CavosLoginButtonProps) => {
-  const cavosContext = useCavos();
+export const CavosLoginButton = ({ disabled = false }: CavosLoginButtonProps) => {
   const { 
     login, 
+    logout, 
     address, 
     isAuthenticated, 
-    walletStatus, 
+    isLoading,
+    walletStatus,
     registerCurrentSession,
-    logout 
-  } = cavosContext;
-  const [isLoading, setIsLoading] = useState(false);
-  const [sessionError, setSessionError] = useState<string | null>(null);
-
-  // Log del estado para depuración
-  useEffect(() => {
-    if (isAuthenticated && address) {
-      console.log('Cavos status:', { 
-        isAuthenticated, 
-        address, 
-        walletStatus,
-        hasRegisterMethod: !!registerCurrentSession 
-      });
-    }
-  }, [isAuthenticated, address, walletStatus, registerCurrentSession]);
+    updateSessionPolicy
+  } = useCavos();
+  const [localLoading, setLocalLoading] = useState(false);
+  const [activating, setActivating] = useState(false);
 
   const handleGoogleLogin = async () => {
-    setIsLoading(true);
-    setSessionError(null);
+    setLocalLoading(true);
     try {
-      // 1. Autenticar con Google
       await login('google');
-
-      // 2. Obtener dirección del contrato
-      const contractAddress = deployedContracts.sepolia?.SealedBidFeedlot?.address;
-      if (!contractAddress) {
-        throw new Error("Contract address not found");
-      }
-
-      // 3. Obtener el objeto cavos (si existe)
-      const cavos = (cavosContext as any).cavos;
-
-      // 4. Crear sesión con política (si existe el método)
-      if (cavos?.createSession) {
-        const policy = {
-          allowedMethods: [
-            { contractAddress, selector: 'commit_bid' },
-            { contractAddress, selector: 'reveal_bid' },
-            { contractAddress, selector: 'finalize_lot' },
-            { contractAddress, selector: 'create_lot' },
-          ],
-          expiresAt: Date.now() + 60 * 60 * 1000, // 1 hora
-        };
-        await cavos.createSession(policy);
-        console.log('✅ Sesión creada');
-      } else {
-        console.warn('createSession no disponible');
-      }
-
-      // 5. Registrar sesión on‑chain (priorizar registerCurrentSession del hook)
-      if (registerCurrentSession) {
-        await registerCurrentSession();
-        console.log('✅ Sesión registrada con registerCurrentSession');
-      } else if (cavos?.registerSession) {
-        await cavos.registerSession();
-        console.log('✅ Sesión registrada con cavos.registerSession');
-      } else {
-        console.warn('No se encontró método para registrar sesión');
-      }
-
-      // 6. Verificar estado final
-      if (walletStatus?.isSessionActive) {
-        toast.success('✅ Wallet lista y sesión activa');
-      } else {
-        setSessionError('Sesión no activa después del registro');
-        toast.error('Sesión no activa. Puede necesitar un reintento.');
-      }
-
-      // 7. Recargar para reiniciar hooks
-      window.location.reload();
+      toast.success('Login successful, wallet ready');
     } catch (err) {
-      console.error('Login error:', err);
       toast.error('Login failed: ' + (err instanceof Error ? err.message : String(err)));
     } finally {
-      setIsLoading(false);
+      setLocalLoading(false);
     }
   };
 
-  const handleRetrySession = async () => {
-    setIsLoading(true);
+  const handleActivateSession = async () => {
+    setActivating(true);
     try {
-      const cavos = (cavosContext as any).cavos;
-      if (cavos?.registerSession) {
-        await cavos.registerSession();
-        toast.success('Sesión registrada manualmente');
-        window.location.reload();
-      } else if (registerCurrentSession) {
-        await registerCurrentSession();
-        toast.success('Sesión registrada manualmente');
-        window.location.reload();
-      } else {
-        toast.error('No hay método para registrar sesión');
-      }
-    } catch (err) {
-      toast.error('Error al registrar sesión: ' + (err instanceof Error ? err.message : String(err)));
+      toast.loading('Updating session policy...', { id: 'activate-policy' });
+      updateSessionPolicy({
+        allowedContracts: [
+          process.env.NEXT_PUBLIC_AUCTION_CONTRACT_ADDRESS || '',
+        ],
+        spendingLimits: [
+          {
+            token: process.env.NEXT_PUBLIC_STRK_TOKEN_ADDRESS || '',
+            limit: BigInt(1000) * BigInt(10 ** 18),
+          },
+        ],
+        maxCallsPerTx: 10,
+      });
+      toast.success('Policy updated', { id: 'activate-policy' });
+
+      toast.loading('Registering session on‑chain...', { id: 'activate-reg' });
+      await registerCurrentSession();
+      toast.success('Session activated!', { id: 'activate-reg' });
+    } catch (err: any) {
+      toast.error('Activation failed: ' + err.message, { id: 'activate-reg' });
     } finally {
-      setIsLoading(false);
+      setActivating(false);
     }
   };
 
-  // Si está autenticado, mostramos la dirección y opciones
   if (isAuthenticated && address) {
     return (
       <div className="flex items-center gap-2">
         <span className="text-sm bg-green-100 dark:bg-green-900 text-gray-800 dark:text-gray-200 px-2 py-1 rounded">
           🔐 {address.slice(0, 6)}...{address.slice(-4)}
         </span>
-        {!walletStatus?.isSessionActive && (
+        {walletStatus && !walletStatus.isReady && (
           <button
-            onClick={handleRetrySession}
-            className="btn btn-xs btn-warning dark:bg-yellow-600 dark:hover:bg-yellow-700 dark:text-white"
-            disabled={isLoading}
+            onClick={handleActivateSession}
+            disabled={activating || localLoading}
+            className="btn btn-xs btn-warning ml-2"
           >
-            Activar sesión
+            {activating ? 'Activating...' : '🔑 Activate'}
           </button>
         )}
-        <button 
-          onClick={() => logout?.() || window.location.reload()} 
+        <button
+          onClick={() => logout?.()}
           className="btn btn-ghost btn-xs dark:text-gray-300 dark:hover:text-white"
-          disabled={isLoading}
+          disabled={isLoading || localLoading || activating}
         >
           ✕
         </button>
@@ -145,15 +88,14 @@ export const CavosLoginButton = ({ disabled }: CavosLoginButtonProps) => {
     );
   }
 
-  // No autenticado: mostramos el botón de login, pero lo envolvemos en un div que lo deshabilita si `disabled` es true
   return (
     <div className={disabled ? "opacity-50 pointer-events-none" : ""}>
       <button
         onClick={handleGoogleLogin}
         className="btn btn-primary btn-sm"
-        disabled={isLoading}
+        disabled={isLoading || localLoading}
       >
-        {isLoading ? (
+        {localLoading || isLoading ? (
           <span className="loading loading-spinner loading-xs mr-2"></span>
         ) : (
           <svg className="w-4 h-4 mr-2" viewBox="0 0 24 24">
